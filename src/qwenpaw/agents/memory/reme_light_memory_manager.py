@@ -3,9 +3,12 @@
 import importlib.metadata
 import json
 import logging
+import os
 import platform
+import re
 import shutil
 import uuid
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -344,7 +347,10 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         min_score: float = 0.1,
     ) -> ToolResponse:
         """
-        Search MEMORY.md and memory/*.md files semantically.
+        Search memory files semantically using triple search:
+        1. ReMeLight (vector + FTS) — primary semantic search
+        2. Knowledge graph (knowledge_graph.jsonl) — entity relationship search
+        3. Text grep — keyword fallback for ReMeLight failure
 
         Use this tool before answering questions about prior work,
         decisions, dates, people, preferences, or todos. Returns top
@@ -364,16 +370,8 @@ class ReMeLightMemoryManager(BaseMemoryManager):
                 content.
         """
         self._warn_if_version_mismatch()
-        if self._reme is None or not getattr(self._reme, "_started", False):
-            return ToolResponse(
-                content=[
-                    TextBlock(
-                        type="text",
-                        text="ReMe is not started, report github issue!",
-                    ),
-                ],
-            )
 
+        # ── Step 1: Tokenize query ──────────────────────────────────────
         try:
             query_final = " ".join(self.tokenize_query(query))
             logger.info(f"Tokenized query: {query_final}")
@@ -381,11 +379,305 @@ class ReMeLightMemoryManager(BaseMemoryManager):
             logger.exception(f"Failed to tokenize query: {e} query={query}")
             query_final = query
 
-        return await self._reme.memory_search(
-            query=query_final,
+        # ── Step 2: Triple search ───────────────────────────────────────
+        # 2a. ReMeLight search (vector + FTS) — primary
+        reme_results: list[dict] = []
+        if self._reme is not None and getattr(self._reme, "_started", False):
+            try:
+                reme_resp = await self._reme.memory_search(
+                    query=query_final,
+                    max_results=max_results,
+                    min_score=min_score,
+                )
+                # Parse ToolResponse content
+                if reme_resp and reme_resp.content:
+                    for block in reme_resp.content:
+                        if isinstance(block, dict) and block.get("text"):
+                            reme_results.append(
+                                {
+                                    "source": "reme",
+                                    "text": block["text"],
+                                },
+                            )
+                        elif isinstance(block, str):
+                            reme_results.append(
+                                {
+                                    "source": "reme",
+                                    "text": block,
+                                },
+                            )
+            except Exception as e:
+                logger.exception(f"ReMeLight search failed: {e}")
+
+        # 2b. Knowledge graph search (knowledge_graph.jsonl)
+        kg_results = self._search_knowledge_graph(
+            query=query,
             max_results=max_results,
-            min_score=min_score,
         )
+
+        # 2c. Text grep fallback (only if ReMeLight returned nothing)
+        grep_results: list[dict] = []
+        if not reme_results:
+            grep_results = self._search_text_grep(
+                query=query,
+                max_results=max_results,
+            )
+
+        # ── Step 3: Merge results ───────────────────────────────────────
+        merged_text = self._merge_search_results(
+            reme_results=reme_results,
+            kg_results=kg_results,
+            grep_results=grep_results,
+            max_results=max_results,
+        )
+
+        return ToolResponse(
+            content=[TextBlock(type="text", text=merged_text)],
+        )
+
+    # ── Knowledge graph search ─────────────────────────────────────────
+
+    def _search_knowledge_graph(
+        self,
+        query: str,
+        max_results: int = 5,
+    ) -> list[dict]:
+        """Search knowledge_graph.jsonl for entities matching the query.
+
+        Matches against entity name, description, and relation types.
+        Returns scored entity groups with their relationships.
+        """
+        kg_path = os.path.join(self.working_dir, "memory", "knowledge_graph.jsonl")
+        if not os.path.isfile(kg_path):
+            return []
+
+        # Extract meaningful keywords from query
+        keywords = [
+            w.lower() for w in re.findall(r"[\w\u4e00-\u9fff]+", query)
+            if len(w) > 1
+        ]
+        if not keywords:
+            return []
+
+        entities: dict[str, dict] = {}
+        edges: list[dict] = []
+        try:
+            with open(kg_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    # Nodes (entities)
+                    if "id" in item and "name" in item:
+                        entities[item["id"]] = item
+                    # Edges (relationships)
+                    elif "from" in item and "to" in item:
+                        edges.append(item)
+        except Exception as e:
+            logger.exception(f"Failed to read knowledge_graph.jsonl: {e}")
+            return []
+
+        if not entities:
+            return []
+
+        # Score each entity by keyword match
+        scored: list[tuple[str, int, str]] = []
+        searchable_texts = {
+            eid: (
+                f"{e.get('name', '')} {e.get('description', '')}"
+                f" {e.get('source', '')}"
+            ).lower()
+            for eid, e in entities.items()
+        }
+
+        for eid, text in searchable_texts.items():
+            score = sum(kw in text for kw in keywords)
+            if score > 0:
+                entity = entities[eid]
+                scored.append(
+                    (eid, score, entity.get("name", eid)),
+                )
+
+        # Sort by score descending
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top_entity_ids = {eid for eid, _, _ in scored[:max_results]}
+
+        # Build relationship context for matched entities
+        result_lines: list[str] = []
+        for eid, score, name in scored[:max_results]:
+            entity = entities[eid]
+            desc = entity.get("description", "")
+            result_lines.append(
+                f"[KG] {name} (score={score})"
+                + (f" — {desc}" if desc else ""),
+            )
+
+            # Find relationships involving this entity
+            for edge in edges:
+                from_id = edge.get("from", "")
+                to_id = edge.get("to", "")
+                relation = edge.get("relation", "")
+                rel_type = edge.get("type", "")
+
+                linked = None
+                if from_id == eid and to_id in entities:
+                    linked = entities[to_id]
+                elif to_id == eid and from_id in entities:
+                    linked = entities[from_id]
+
+                if linked:
+                    direction = (
+                        f"→ {linked.get('name', to_id)}"
+                        if from_id == eid
+                        else f"← {linked.get('name', from_id)}"
+                    )
+                    result_lines.append(
+                        f"  └─ {relation} {direction}"
+                        + (f" [{rel_type}]" if rel_type else ""),
+                    )
+
+        # Format as search result objects
+        if not result_lines:
+            return []
+
+        return [
+            {
+                "source": "knowledge_graph",
+                "text": "=== Knowledge Graph Search ==="
+                + "\n"
+                + "\n".join(result_lines),
+            },
+        ]
+
+    # ── Text grep fallback ─────────────────────────────────────────────
+
+    def _search_text_grep(
+        self,
+        query: str,
+        max_results: int = 5,
+    ) -> list[dict]:
+        """Search memory files using keyword-based grep as fallback.
+
+        Only triggered when ReMeLight returns empty results.
+        """
+        keywords = [
+            w.lower() for w in re.findall(r"[\w\u4e00-\u9fff]+", query)
+            if len(w) > 1
+        ]
+        if not keywords:
+            return []
+
+        memory_dir = os.path.join(self.working_dir, "memory")
+        memory_md = os.path.join(self.working_dir, "MEMORY.md")
+        search_paths = []
+
+        if os.path.isfile(memory_md):
+            search_paths.append(memory_md)
+        if os.path.isdir(memory_dir):
+            search_paths.extend(
+                os.path.join(memory_dir, f)
+                for f in os.listdir(memory_dir)
+                if f.endswith(".md") or f.endswith(".jsonl")
+            )
+
+        if not search_paths:
+            return []
+
+        # Search each file
+        matched_snippets: list[tuple[str, str, int, int]] = []
+        # (file_path, line_content, line_number, match_count)
+
+        for file_path in search_paths:
+            try:
+                with open(file_path, encoding="utf-8") as f:
+                    for lineno, line in enumerate(f, 1):
+                        line_lower = line.lower()
+                        hits = sum(kw in line_lower for kw in keywords)
+                        if hits > 0:
+                            matched_snippets.append(
+                                (file_path, line.strip(), lineno, hits),
+                            )
+            except Exception:
+                continue
+
+        # Sort by match count descending
+        matched_snippets.sort(key=lambda x: x[3], reverse=True)
+
+        # Group by file, limit to top few per file
+        seen_files: set[str] = set()
+        result_lines: list[str] = []
+        for fpath, content, lineno, hits in matched_snippets:
+            # Limit to max_results total unique files
+            if len(seen_files) >= max_results:
+                break
+
+            # Show relative path
+            try:
+                rel_path = os.path.relpath(fpath, self.working_dir)
+            except ValueError:
+                rel_path = fpath
+
+            if rel_path not in seen_files:
+                seen_files.add(rel_path)
+                result_lines.append(f"--- {rel_path} ---")
+
+            result_lines.append(f"  L{lineno}: {content[:200]}")
+
+        if not result_lines:
+            return []
+
+        return [
+            {
+                "source": "grep",
+                "text": "=== Text Grep Search ==="
+                + "\n"
+                + "\n".join(result_lines),
+            },
+        ]
+
+    # ── Merge results ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _merge_search_results(
+        reme_results: list[dict],
+        kg_results: list[dict],
+        grep_results: list[dict],
+        max_results: int,
+    ) -> str:
+        """Merge result sections, dedup, and format.
+
+        Priority: ReMeLight (primary) > Knowledge Graph > Grep fallback
+        """
+        sections: list[str] = []
+        seen_texts: set[str] = set()
+
+        def add_section(label: str, results: list[dict]) -> None:
+            if not results:
+                return
+            texts = []
+            for r in results:
+                t = r.get("text", "")
+                if t and t not in seen_texts:
+                    seen_texts.add(t)
+                    texts.append(t)
+            if texts:
+                sections.append("\n".join(texts))
+
+        # Order: ReMeLight first, then KG, then grep
+        add_section("", reme_results)
+        add_section("", kg_results)
+        add_section("", grep_results)
+
+        combined = "\n\n".join(sections)
+        if not combined:
+            return "No relevant memory found."
+
+        return combined
 
     async def summarize(self, messages: list[Msg], **_kwargs) -> str:
         """Generate a summary of the given messages and persist to memory."""
