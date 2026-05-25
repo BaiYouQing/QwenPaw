@@ -39,6 +39,11 @@ _REME_STORE_VERSION = "v1"
 _EXPECTED_REME_VERSION = "0.3.1.8"
 # Maximum number of tokens from query splitting
 MAX_QUERY_TOKENS = 50
+# ── Knowledge graph search limits ──
+_KG_MAX_RELATIONS_PER_ENTITY = 5      # Max relations to show per matched entity
+_KG_MAX_CHARS = 1500                   # Max total chars for KG output
+_MERGED_MAX_CHARS = 3000               # Max total chars for merged triplesearch output
+_KG_MAX_NEIGHBORS_EXPLORE = 5          # Max neighbors to explore per entity in BFS
 
 
 def _detect_memory_manager_backend() -> str:
@@ -345,6 +350,7 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         query: str,
         max_results: int = 5,
         min_score: float = 0.1,
+        kg_depth: int = 1,
     ) -> ToolResponse:
         """
         Search memory files semantically using triple search:
@@ -363,6 +369,9 @@ class ReMeLightMemoryManager(BaseMemoryManager):
                 Maximum number of search results to return. Defaults to 5.
             min_score (`float`, optional):
                 Minimum similarity score for results. Defaults to 0.1.
+            kg_depth (`int`, optional):
+                Knowledge graph search depth. 1=direct relations only,
+                2=relations of relations, 3=three hops deep. Defaults to 1.
 
         Returns:
             `ToolResponse`:
@@ -413,6 +422,7 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         kg_results = self._search_knowledge_graph(
             query=query,
             max_results=max_results,
+            depth=kg_depth,
         )
 
         # 2c. Text grep fallback (only if ReMeLight returned nothing)
@@ -441,13 +451,24 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         self,
         query: str,
         max_results: int = 5,
+        depth: int = 1,
     ) -> list[dict]:
         """Search knowledge_graph.jsonl for entities matching the query.
 
-        Matches against entity name, description, and relation types.
-        Returns scored entity groups with their relationships.
+        Supports multi-hop BFS traversal: at depth=1 only shows direct
+        relations; at depth=2 follows relations of relations, etc.
+
+        Args:
+            query: Search keywords
+            max_results: Max root entities to show
+            depth: BFS traversal depth (1=direct, 2=two hops, etc.)
+
+        Returns:
+            List of result dicts with formatted text
         """
-        kg_path = os.path.join(self.working_dir, "memory", "knowledge_graph.jsonl")
+        kg_path = os.path.join(
+            self.working_dir, "memory", "knowledge_graph.jsonl",
+        )
         if not os.path.isfile(kg_path):
             return []
 
@@ -485,6 +506,18 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         if not entities:
             return []
 
+        # Build adjacency: entity_id -> list of (neighbor_id, relation, direction)
+        adj: dict[str, list[tuple[str, str, str]]] = {}
+        # direction: 'out' (from→to neighbor), 'in' (to←from neighbor)
+        for edge in edges:
+            f = edge.get("from", "")
+            t = edge.get("to", "")
+            r = edge.get("relation", "")
+            if f in entities:
+                adj.setdefault(f, []).append((t, r, "out"))
+            if t in entities:
+                adj.setdefault(t, []).append((f, r, "in"))
+
         # Score each entity by keyword match
         scored: list[tuple[str, int, str]] = []
         searchable_texts = {
@@ -498,18 +531,16 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         for eid, text in searchable_texts.items():
             score = sum(kw in text for kw in keywords)
             if score > 0:
-                entity = entities[eid]
                 scored.append(
-                    (eid, score, entity.get("name", eid)),
+                    (eid, score, entities[eid].get("name", eid)),
                 )
 
         # Sort by score descending
         scored.sort(key=lambda x: x[1], reverse=True)
-        top_entity_ids = {eid for eid, _, _ in scored[:max_results]}
+        top_entities = scored[:max_results]
 
-        # Build relationship context for matched entities
         result_lines: list[str] = []
-        for eid, score, name in scored[:max_results]:
+        for eid, score, name in top_entities:
             entity = entities[eid]
             desc = entity.get("description", "")
             result_lines.append(
@@ -517,40 +548,60 @@ class ReMeLightMemoryManager(BaseMemoryManager):
                 + (f" — {desc}" if desc else ""),
             )
 
-            # Find relationships involving this entity
-            for edge in edges:
-                from_id = edge.get("from", "")
-                to_id = edge.get("to", "")
-                relation = edge.get("relation", "")
-                rel_type = edge.get("type", "")
+            # ── BFS traversal from this entity ──────────────────
+            visited: set[str] = set()
+            # Each level entry: (entity_id, relation_that_led_here, direction_from_parent)
+            current_level: list[tuple[str, str, str]] = [
+                (eid, "", "root"),
+            ]
+            level_num = 0
 
-                linked = None
-                if from_id == eid and to_id in entities:
-                    linked = entities[to_id]
-                elif to_id == eid and from_id in entities:
-                    linked = entities[from_id]
+            while current_level and level_num <= depth:
+                next_level: list[tuple[str, str, str]] = []
+                indent = "  " * (level_num + 1)
 
-                if linked:
-                    direction = (
-                        f"→ {linked.get('name', to_id)}"
-                        if from_id == eid
-                        else f"← {linked.get('name', from_id)}"
-                    )
-                    result_lines.append(
-                        f"  └─ {relation} {direction}"
-                        + (f" [{rel_type}]" if rel_type else ""),
-                    )
+                for cur_id, cur_rel, cur_dir in current_level:
+                    if level_num > 0:
+                        cur_name = entities.get(
+                            cur_id, {},
+                        ).get("name", cur_id)
+                        dir_symbol = "→" if cur_dir == "out" else "←"
+                        result_lines.append(
+                            f"{indent}{dir_symbol} {cur_name}"
+                            f"  [{cur_rel}]",
+                        )
 
-        # Format as search result objects
+                    if level_num >= depth:
+                        continue
+
+                    # Explore neighbors (limit to _KG_MAX_NEIGHBORS_EXPLORE)
+                    explored = 0
+                    for nb_id, rel, nb_dir in adj.get(cur_id, []):
+                        if explored >= _KG_MAX_NEIGHBORS_EXPLORE:
+                            break
+                        if nb_id not in visited and nb_id != eid:
+                            visited.add(nb_id)
+                            next_level.append((nb_id, rel, nb_dir))
+                            explored += 1
+
+                current_level = next_level
+                level_num += 1
+
+            if eid not in adj:
+                result_lines.append("  └─ (无关联关系)")
+
+        # Trim total KG output to _KG_MAX_CHARS
+        combined = "\n".join(result_lines)
+        if len(combined) > _KG_MAX_CHARS:
+            combined = combined[:_KG_MAX_CHARS] + "\n... (已截断)"
+
         if not result_lines:
             return []
 
         return [
             {
                 "source": "knowledge_graph",
-                "text": "=== Knowledge Graph Search ==="
-                + "\n"
-                + "\n".join(result_lines),
+                "text": "=== Knowledge Graph Search ===" + "\n" + combined,
             },
         ]
 
