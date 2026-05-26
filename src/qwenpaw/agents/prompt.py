@@ -61,6 +61,7 @@ class PromptBuilder:
         heartbeat_enabled: bool = False,
         language: str = "zh",
         memory_manager: BaseMemoryManager | None = None,
+        session_id: str | None = None,
     ):
         """Initialize prompt builder.
 
@@ -70,12 +71,14 @@ class PromptBuilder:
             heartbeat_enabled: Whether heartbeat is enabled, affects AGENTS.md content
             language: Language code used to select the memory prompt.
             memory_manager: Memory manager instance for generating memory prompts.
+            session_id: Session ID for loading session-specific thinking board.
         """
         self.working_dir = working_dir
         self.enabled_files = enabled_files
         self.heartbeat_enabled = heartbeat_enabled
         self.language = language
         self.memory_manager = memory_manager
+        self.session_id = session_id
         self.prompt_parts = []
         self.loaded_count = 0
 

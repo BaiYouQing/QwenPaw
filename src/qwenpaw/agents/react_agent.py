@@ -1432,6 +1432,32 @@ class QwenPawAgent(CodingModeMixin, ToolGuardMixin, ReActAgent):
             self._agent_config.running.shell_command_executable or None,
         )
 
+        # Inject thinking board into system prompt
+        import re as _re
+
+        session_id = self._request_context.get("session_id") or None
+        if session_id:
+            # Escape special chars (Windows forbids \ / : * ? " < > |)
+            safe_id = _re.sub(r'[<>:"/\\|?*]', "_", session_id)
+            tb_dir = Path(self._workspace_dir) / "memory" / "thinking_boards"
+            tb_file = tb_dir / f"thinking_board_{safe_id}.md"
+            if tb_file.exists():
+                try:
+                    tb_content = tb_file.read_text(encoding="utf-8").strip()
+                    if tb_content:
+                        tb_section = f"\n\n# Thinking Board\n\n{tb_content}"
+                        new_sys_prompt = self._build_sys_prompt() + tb_section
+                        self._sys_prompt = new_sys_prompt
+                        if self.memory is not None:
+                            for msg, _marks in self.memory.content:
+                                if msg.role == "system":
+                                    msg.content = new_sys_prompt
+                                    break
+                except Exception as e:
+                    logger.warning(
+                        "Failed to inject thinking board: %s", e,
+                    )
+
         # Process file and media blocks in messages
         if msg is not None:
             await process_file_and_media_blocks_in_message(msg)
