@@ -1432,32 +1432,6 @@ class QwenPawAgent(CodingModeMixin, ToolGuardMixin, ReActAgent):
             self._agent_config.running.shell_command_executable or None,
         )
 
-        # Inject thinking board into system prompt
-        import re as _re
-
-        session_id = self._request_context.get("session_id") or None
-        if session_id:
-            # Escape special chars (Windows forbids \ / : * ? " < > |)
-            safe_id = _re.sub(r'[<>:"/\\|?*]', "_", session_id)
-            tb_dir = Path(self._workspace_dir) / "memory" / "thinking_boards"
-            tb_file = tb_dir / f"thinking_board_{safe_id}.md"
-            if tb_file.exists():
-                try:
-                    tb_content = tb_file.read_text(encoding="utf-8").strip()
-                    if tb_content:
-                        tb_section = f"\n\n# Thinking Board\n\n{tb_content}"
-                        new_sys_prompt = self._build_sys_prompt() + tb_section
-                        self._sys_prompt = new_sys_prompt
-                        if self.memory is not None:
-                            for msg, _marks in self.memory.content:
-                                if msg.role == "system":
-                                    msg.content = new_sys_prompt
-                                    break
-                except Exception as e:
-                    logger.warning(
-                        "Failed to inject thinking board: %s", e,
-                    )
-
         # Process file and media blocks in messages
         if msg is not None:
             await process_file_and_media_blocks_in_message(msg)
@@ -1473,6 +1447,59 @@ class QwenPawAgent(CodingModeMixin, ToolGuardMixin, ReActAgent):
             msg = await self.command_handler.handle_command(query)
             await self.print(msg)
             return msg
+
+        # Inject thinking board into system prompt (session-specific)
+        _tb_session_id = self._request_context.get("session_id") or None
+        if _tb_session_id:
+            import re as _tb_re
+
+            _tb_safe_id = _tb_re.sub(r'[<>:"/\\|?*]', "_", _tb_session_id)
+            _tb_file = (
+                Path(self._workspace_dir)
+                / "memory"
+                / "thinking_boards"
+                / f"thinking_board_{_tb_safe_id}.md"
+            )
+
+            # Auto-create empty template if not exist
+            if not _tb_file.exists():
+                try:
+                    _tb_file.parent.mkdir(parents=True, exist_ok=True)
+                    _tb_file.write_text(
+                        "# Thinking Board\n\n"
+                        "<!-- 宝宝：用 write_file 更新 -->\n\n"
+                        f"_Created: {_tb_safe_id}_\n",
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    pass
+
+            # Read and inject thinking board (remove old version first)
+            if _tb_file.exists():
+                try:
+                    _tb_content = _tb_file.read_text(encoding="utf-8").strip()
+                    if _tb_content:
+                        _tb_marker = "\n\n# Thinking Board\n\n"
+                        if _tb_marker in self._sys_prompt:
+                            self._sys_prompt = self._sys_prompt.split(_tb_marker)[0]
+                        self._sys_prompt = (
+                            self._sys_prompt + _tb_marker + _tb_content
+                        )
+                except Exception:
+                    pass
+
+        # Inject current datetime into system prompt
+        try:
+            from datetime import datetime as _dt
+
+            _now = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+            _time_marker = f"\n\n# Current Time\n\n{_now}"
+            # Remove old time marker if present
+            if "# Current Time" in self._sys_prompt:
+                self._sys_prompt = self._sys_prompt.split("\n\n# Current Time")[0]
+            self._sys_prompt = self._sys_prompt + _time_marker
+        except Exception:
+            pass
 
         # Normal message processing
         logger.info("QwenPawAgent.reply: max_iters=%s", self.max_iters)
